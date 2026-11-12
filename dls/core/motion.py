@@ -82,6 +82,7 @@ class MotionDetector:
         self._stale = np.zeros((self.h, self.w), np.uint16)
         self._protected = np.zeros((self.h, self.w), bool)
         self._frames = 0
+        self._seen = 0  # frames since the last reset, for the contrast warm-up
         self.relearned_px = 0
         self.rebases = 0
 
@@ -106,7 +107,11 @@ class MotionDetector:
                 boxes.append((int(x * f), int(y * f), int((x + w) * f), int((y + h) * f)))
 
         pct_motion = total_area / (self.h * self.w)
-        if pct_motion < 0.05 and len(boxes) <= 4:
+        # The (0, 255) contrast seed keeps changing the stretched image until the history is full, which reads as
+        # motion on a static scene: calibration ends only once every history entry comes from real frames.
+        self._seen += 1
+        settled = not self.improve_contrast or self._seen >= len(self.contrast_values)
+        if pct_motion < 0.05 and len(boxes) <= 4 and settled:
             self.calibrating = False
         if self.calibrating or pct_motion > self.lightning_threshold:
             self.calibrating = True

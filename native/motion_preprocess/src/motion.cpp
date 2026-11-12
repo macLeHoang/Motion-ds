@@ -47,6 +47,7 @@ void MotionDetector::reset() {
     calibrating_ = true;
     motion_count_ = 0;
     frames_ = 0;
+    observed_ = 0;
     rebases_ = 0;
 }
 
@@ -190,7 +191,11 @@ std::vector<Box> MotionDetector::detect_small(const cv::Mat& small) {
         }
     }
     double pct = total / (sw_ * sh_);
-    if (pct < .05 && boxes.size() <= 4)
+    // The contrast history starts at (0, 255) and keeps changing the normalised image until it is full, which reads as
+    // motion on a static scene; so calibration ends only once every history entry comes from real frames.
+    ++observed_;
+    bool settled = !config_.improve_contrast || observed_ >= config_.history;
+    if (pct < .05 && boxes.size() <= 4 && settled)
         calibrating_ = false;
     if (calibrating_ || pct > config_.lightning_threshold)
         calibrating_ = true;

@@ -18,6 +18,13 @@ int main() {
         for (int y = 0; y < bg.rows; ++y)
             for (int x = 0; x < bg.cols; ++x)
                 bg.at<unsigned char>(y, x) = 70 + (x / 8 + y / 8) % 40;
+        MotionDetector warm(bg.cols, bg.rows);
+        for (int i = 0; i < 400; ++i) {
+            auto boxes = warm.detect(bg);
+            check(i + 1 >= MotionConfig{}.history || warm.calibrating(),
+                  "calibration ended before the contrast history filled");
+            check(warm.calibrating() || boxes.empty(), "static scene reported motion after calibration");
+        }
         MotionDetector md(bg.cols, bg.rows);
         for (int i = 0; i < 400; ++i)
             md.detect(bg);

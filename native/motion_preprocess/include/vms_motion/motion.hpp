@@ -45,7 +45,7 @@ public:
 private:
     cv::Mat prepare(cv::Mat small, bool update = true);
     void relearn(const cv::Mat& small, const cv::Mat& prepared, const cv::Mat& delta);
-    int width_, height_, sw_, sh_, history_index_ = 0, motion_count_ = 0, frames_ = 0;
+    int width_, height_, sw_, sh_, history_index_ = 0, motion_count_ = 0, frames_ = 0, observed_ = 0;
     MotionConfig config_;
     cv::Mat average_, mask_, previous_, stale_, protected_;
     std::vector<cv::Vec2b> contrast_;
