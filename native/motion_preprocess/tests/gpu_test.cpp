@@ -83,6 +83,16 @@ int main() {
             cv::norm(reference, cv::Mat(ch, cw, CV_8UC4, rendered.data()), cv::NORM_INF) <= 1,
             "GPU canvas differs from reference"
         );
+        // A full-frame slot is a plan with one tile covering the frame: it must equal the Ultralytics letterbox.
+        auto full = pack({{0, 0, w, h}}, cw, ch);
+        cv::Mat letterbox(ch, cw, CV_8UC4, cv::Scalar(114, 114, 114, 255)), scaled;
+        cv::resize(image, scaled, {full.resized_w, full.resized_h}, 0, 0, cv::INTER_LINEAR);
+        scaled.copyTo(letterbox(cv::Rect(full.pad_x, full.pad_y, full.resized_w, full.resized_h)));
+        auto whole = kernels.canvas(view, full);
+        check(
+            cv::norm(letterbox, cv::Mat(ch, cw, CV_8UC4, whole.data()), cv::NORM_INF) <= 1,
+            "full-frame canvas differs from the letterbox"
+        );
         cuda_check(cudaMalloc(&tensor, 3 * cw * ch * sizeof(float)), "allocate test tensor");
         std::array<float, 3> scales{.01f, .02f, .03f}, offsets{-.5f, .1f, .25f};
         for (bool half : {false, true})
@@ -187,6 +197,25 @@ int main() {
         auto invalid = init;
         invalid.user_configs["periodic-full-frame"] = "1";
         check(initLib(invalid) == nullptr, "unsupported full-frame policy accepted");
+        auto tracked = init;
+        tracked.user_configs["full-frame-interval"] = "25";
+        tracked.user_configs["region-max-misses"] = "25";
+        tracked.user_configs["mosaic-classes"] = "0";
+        tracked.user_configs["full-frame-classes"] = "1;2;3;4;5;6";
+        auto* tracked_ctx = initLib(tracked);
+        check(tracked_ctx != nullptr, "full-frame and region configuration rejected");
+        deInitLib(tracked_ctx);
+        const std::pair<const char*, const char*> bad_values[] = {
+            {"region-max-misses", "0"},
+            {"full-frame-interval", "-1"},
+            {"mosaic-classes", "81"},
+            {"parser-lib", "/nonexistent/libparser.so"}
+        };
+        for (const auto& [key, value] : bad_values) {
+            auto bad = init;
+            bad.user_configs[key] = value;
+            check(initLib(bad) == nullptr, "invalid full-frame/region configuration accepted");
+        }
         auto* warmup = initLib(init);
         check(warmup != nullptr, "context warmup failed");
         deInitLib(warmup);

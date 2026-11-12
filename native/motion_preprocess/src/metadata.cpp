@@ -7,7 +7,7 @@
 
 namespace vms_motion {
 NvDsMetaType placement_meta_type() {
-    static gchar name[] = "VMS.MOTION_MOSAIC.PLACEMENTS.V1";
+    static gchar name[] = "VMS.MOTION_MOSAIC.PLACEMENTS.V2";  // V2: full-frame slot and regions in FramePlan
     static auto type = nvds_get_user_meta_type(name);
     return type;
 }
@@ -52,7 +52,7 @@ const FramePlan* frame_plan(const NvDsFrameMeta* frame, unsigned component) {
         auto* u = static_cast<NvDsUserMeta*>(l->data);
         if (u->base_meta.meta_type == placement_meta_type()) {
             auto* p = static_cast<FramePlan*>(u->user_meta_data);
-            if (p && p->version == 1 && p->component_id == component)
+            if (p && p->version == FramePlan{}.version && p->component_id == component)
                 return p;
         }
     }

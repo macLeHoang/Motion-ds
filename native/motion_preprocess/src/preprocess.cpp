@@ -1,4 +1,4 @@
-#include "vms_motion/gpu.hpp"
+#include "context.hpp"
 #include "vms_motion/metadata.hpp"
 
 #include <chrono>
@@ -19,28 +19,6 @@ using namespace vms_motion;
 using Json = nlohmann::json;
 
 namespace {
-struct Context {
-    unsigned id = 0;
-    int device = 0, capacity = 0;
-    Config config;
-    bool fp16 = false, bgr = false;
-    std::array<float, 3> scale{1.f / 255, 1.f / 255, 1.f / 255}, offset{0, 0, 0};
-    std::unique_ptr<Processor> processor;
-    std::unique_ptr<Gpu> gpu;
-    std::mutex mutex;
-    std::string preview_dir;
-    std::string preview_session;
-    double preview_fps = 1;
-    std::uint64_t preview_seq = 0;
-    std::unordered_map<unsigned, double> last_preview;
-    std::ofstream events;
-
-    ~Context() {
-        cudaSetDevice(device);
-        gpu.reset();
-    }
-};
-
 std::mutex registry_mutex;
 std::unordered_map<unsigned, std::weak_ptr<Context>> registry;
 
@@ -89,6 +67,29 @@ std::array<float, 3> triple(
     return fallback;
 }
 
+// Semicolon-separated class ids; a missing key selects every class.
+std::vector<bool> classes(
+    const std::unordered_map<std::string, std::string>& values, const char* key, int count
+) {
+    std::vector<bool> out(count, true);
+    auto it = values.find(key);
+    if (it == values.end())
+        return out;
+    out.assign(count, false);
+    std::istringstream input(it->second);
+    std::string token;
+    while (std::getline(input, token, ';')) {
+        if (token.empty())
+            continue;
+        std::size_t end = 0;
+        int id = std::stoi(token, &end);
+        if (end != token.size() || id < 0 || id >= count)
+            throw std::invalid_argument(std::string("invalid class id in ") + key);
+        out[id] = true;
+    }
+    return out;
+}
+
 std::vector<Polygon> polygons(const Json& value) {
     if (!value.is_array())
         throw std::invalid_argument("masks must be an array of polygons");
@@ -135,6 +136,11 @@ Json plan_json(const FramePlan& p) {
         {"scale", Json::array({p.plan.scale_x, p.plan.scale_y})},
         {"letterbox_offset", Json::array({p.plan.pad_x, p.plan.pad_y})},
         {"placements", tiles},
+        {"motion_boxes", p.motion_boxes},
+        {"regions", p.regions},
+        {"full_slot", p.full_slot < 0 ? Json(nullptr) : Json(p.full_slot)},
+        {"full_scale", Json::array({p.full_plan.scale_x, p.full_plan.scale_y})},
+        {"full_letterbox_offset", Json::array({p.full_plan.pad_x, p.full_plan.pad_y})},
         {"timings_ms",
          {{"motion", p.motion_ms}, {"packing", p.packing_ms}, {"tensor", p.tensor_ms}}}
     };
@@ -258,7 +264,24 @@ extern "C" CustomCtx* initLib(CustomInitParams params) {
             "mask-polygons",
             "source-masks",
             "preview-dir",
-            "preview-fps"
+            "preview-fps",
+            "full-frame-interval",
+            "full-frame-stagger",
+            "region-max-misses",
+            "region-padding",
+            "region-match-iou",
+            "region-score",
+            "seed-score",
+            "max-regions",
+            "infer-unique-id",
+            "num-classes",
+            "det-score",
+            "dedupe-iou",
+            "mosaic-classes",
+            "full-frame-classes",
+            "labels-file",
+            "parser-lib",
+            "parser-func"
         };
         for (const auto& item : u)
             if (!allowed.count(item.first))
@@ -295,6 +318,43 @@ extern "C" CustomCtx* initLib(CustomInitParams params) {
                     throw std::invalid_argument("invalid mask source ID");
                 c->config.source_masks[unsigned(source)] = polygons(mask.value());
             }
+        }
+        c->config.full_interval = integer(u, "full-frame-interval", 0);
+        int stagger = integer(u, "full-frame-stagger", 1);
+        if (stagger != 0 && stagger != 1)
+            throw std::invalid_argument("full-frame-stagger must be 0 or 1");
+        c->config.full_stagger = stagger;
+        auto& r = c->config.regions;
+        r.max_misses = integer(u, "region-max-misses", r.max_misses);
+        r.padding = number(u, "region-padding", r.padding);
+        r.match_iou = number(u, "region-match-iou", r.match_iou);
+        r.region_score = number(u, "region-score", r.region_score);
+        r.seed_score = number(u, "seed-score", r.seed_score);
+        r.max_regions = integer(u, "max-regions", r.max_regions);
+        auto& d = c->decoder;
+        d.infer_id = unsigned(integer(u, "infer-unique-id", int(d.infer_id)));
+        d.num_classes = integer(u, "num-classes", d.num_classes);
+        if (!d.infer_id || d.num_classes < 1)
+            throw std::invalid_argument("infer-unique-id and num-classes must be positive");
+        d.det_score = float(number(u, "det-score", d.det_score));
+        d.dedupe_iou = float(number(u, "dedupe-iou", d.dedupe_iou));
+        d.mosaic_classes = classes(u, "mosaic-classes", d.num_classes);
+        d.full_classes = classes(u, "full-frame-classes", d.num_classes);
+        if (auto it = u.find("labels-file"); it != u.end() && !it->second.empty()) {
+            std::ifstream labels(it->second);
+            if (!labels)
+                throw std::invalid_argument("cannot read labels-file " + it->second);
+            for (std::string line; std::getline(labels, line);)
+                d.labels.push_back(line);
+        }
+        if (auto it = u.find("parser-lib"); it != u.end() && !it->second.empty()) {
+            d.parser_lib = dlopen(it->second.c_str(), RTLD_NOW);
+            if (!d.parser_lib)
+                throw std::invalid_argument(std::string("cannot load parser-lib: ") + dlerror());
+            auto name = u.count("parser-func") ? u.at("parser-func") : std::string("NvDsInferYoloAttr");
+            d.parse = dlsym(d.parser_lib, name.c_str());
+            if (!d.parse)
+                throw std::invalid_argument("parser-func " + name + " not found in parser-lib");
         }
         c->processor = std::make_unique<Processor>(c->config);
         cuda_check(cudaSetDevice(c->device), "select GPU");
@@ -335,15 +395,14 @@ extern "C" void deInitLib(CustomCtx* ctx) {
     delete ctx;
 }
 
+std::shared_ptr<Context> vms_motion::find_context(unsigned component) {
+    std::lock_guard<std::mutex> lock(registry_mutex);
+    auto it = registry.find(component);
+    return it == registry.end() ? nullptr : it->second.lock();
+}
+
 extern "C" bool vms_motion_reset_source(unsigned component, unsigned source) {
-    std::shared_ptr<Context> c;
-    {
-        std::lock_guard<std::mutex> lock(registry_mutex);
-        auto it = registry.find(component);
-        if (it == registry.end())
-            return false;
-        c = it->second.lock();
-    }
+    auto c = find_context(component);
     if (!c)
         return false;
     std::lock_guard<std::mutex> lock(c->mutex);
@@ -404,29 +463,38 @@ extern "C" NvDsPreProcessStatus CustomTensorPreparation(
             );
             p.component_id = c->id;
             p.motion_ms += gray_ms;
-            if (p.status == Status::Active) {
+            // One tensor slot per plan; nvinfer returns slot j's outputs on roi_vector[j], so a frame may own two.
+            auto write = [&](const Plan& plan) {
+                if (slot >= unsigned(c->capacity))
+                    throw std::invalid_argument(
+                        "mosaic and full-frame slots exceed the network-input-shape batch"
+                    );
                 if (!buf) {
                     buf = acquirer->acquire();
                     if (!buf || !buf->memory_ptr)
                         throw std::runtime_error("tensor pool exhausted");
                 }
-                p.tensor_slot = slot++;
-                auto started = std::chrono::steady_clock::now();
                 c->gpu->tensor(
                     view,
-                    p.plan,
-                    static_cast<unsigned char*>(buf->memory_ptr) + p.tensor_slot * sample_bytes,
+                    plan,
+                    static_cast<unsigned char*>(buf->memory_ptr) + slot * sample_bytes,
                     c->fp16,
                     c->bgr,
                     c->scale,
                     c->offset
                 );
-                p.tensor_ms = std::chrono::duration<double, std::milli>(
-                                  std::chrono::steady_clock::now() - started
-                )
-                                  .count();
                 tensor.seq_params.roi_vector.push_back(unit.roi_meta);
-            }
+                return int(slot++);
+            };
+            auto started = std::chrono::steady_clock::now();
+            if (p.status == Status::Active)
+                p.tensor_slot = write(p.plan);
+            if (!p.full_plan.tiles.empty())
+                p.full_slot = write(p.full_plan);
+            p.tensor_ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - started
+            )
+                              .count();
             preview(*c, view, p);
             plans.push_back(std::move(p));
         }
