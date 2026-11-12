@@ -267,6 +267,7 @@ extern "C" CustomCtx* initLib(CustomInitParams params) {
             "preview-fps",
             "full-frame-interval",
             "full-frame-stagger",
+            "full-frame-hold",
             "region-max-misses",
             "region-padding",
             "region-match-iou",
@@ -340,6 +341,10 @@ extern "C" CustomCtx* initLib(CustomInitParams params) {
         d.dedupe_iou = float(number(u, "dedupe-iou", d.dedupe_iou));
         d.mosaic_classes = classes(u, "mosaic-classes", d.num_classes);
         d.full_classes = classes(u, "full-frame-classes", d.num_classes);
+        int hold = integer(u, "full-frame-hold", 0);
+        if (hold != 0 && hold != 1)
+            throw std::invalid_argument("full-frame-hold must be 0 or 1");
+        d.hold_full = hold;
         if (auto it = u.find("labels-file"); it != u.end() && !it->second.empty()) {
             std::ifstream labels(it->second);
             if (!labels)

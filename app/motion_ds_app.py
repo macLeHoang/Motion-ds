@@ -38,7 +38,7 @@ sys.path[:0] = [str(ROOT / "third_party/nvdsinfer_yolo_attr"), str(ROOT / "analy
 import yolo_attr_probe  # noqa: E402
 from display import display_masks  # noqa: E402
 
-ORIGIN = {1: "mosaic", 2: "full"}  # misc_obj_info[0], set by vms_motion_decode_probe
+ORIGIN = {1: "mosaic", 2: "full", 3: "held"}  # misc_obj_info[0], set by vms_motion_decode_probe
 UNTRACKED = 0xFFFFFFFFFFFFFFFF
 
 

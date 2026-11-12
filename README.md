@@ -63,6 +63,7 @@ mosaic input) and `summary.json`; `analyse.sh` adds `analysis/`.
 | Mux size (frame coordinates of crops and boxes) | `configs/app.yaml` | `muxer.width`, `muxer.height` | 1280×720 (native) |
 | Full frame every N frames per camera; 0 = never | `configs/preprocess.ini` | `full-frame-interval` | 25 (1 s) |
 | Cameras take turns for the full frame | `preprocess.ini` | `full-frame-stagger` | 1 |
+| Re-attach full-frame detections until the next full frame (origin `held`) | `preprocess.ini` | `full-frame-hold` | 1 |
 | K: inferred frames without a person before a region is removed | `preprocess.ini` | `region-max-misses` | 25 |
 | Region growth / match / cap | `preprocess.ini` | `region-padding`, `region-match-iou`, `max-regions` | 0.2, 0.3, 16 |
 | Person score to refresh a region (mosaic) / seed one (full frame) | `preprocess.ini` | `region-score`, `seed-score` | 0.5, 0.5 |
@@ -91,8 +92,14 @@ mosaic input) and `summary.json`; `analyse.sh` adds `analysis/`.
   objects carry the same 160-float payload in `mask_params` as production `NvDsInferYoloAttr` objects, origin in
   `misc_obj_info[0]` (1 mosaic, 2 full frame). It sets `bInferDone` on inferred frames (nvtracker ignores objects
   otherwise) and queues region feedback that the next batch applies (it must not wait on the preprocessing lock).
-- **Tracker.** Production NvDCF config. Between full frames the tracker draws predicted boxes for full-frame classes
-  (e.g. plates); those carry no payload and are skipped by `yolo_attr_probe` and the dump.
+- **Tracker.** Production NvDCF config. Full-frame classes are detected only every N frames while the mosaic marks most
+  frames as inferred, so NvDCF would end their tracks before confirming them (`earlyTerminationAge 3`,
+  `probationAge 5`): fire.mp4 gave no fire at all after the tracker. `full-frame-hold=1` re-attaches a camera's last
+  full-frame detections of those classes (origin `held`, `misc_obj_info[0] = 3`, at most N frames old) until its next
+  full frame. Tracker-only boxes (no detection that frame) carry no payload and are skipped by `yolo_attr_probe` and
+  the dump.
+- Overrides per run without editing files: `--mux 2560x1440`, `--set full-frame-interval=30`, `--set
+  'mask-polygons=[[[...]]]'` (any `[user-configs]` key).
 
 ## Changes to the vendored library
 
@@ -136,6 +143,27 @@ N = 25, K = 25, mux 1280×720. Reference: full-frame 768 inference on every fram
   (154 fps with it on).
 - Library acceptance test (`scripts/acceptance.sh 8`) passes fully: static clip 0 active frames (21 before the
   warm-up fix), moving clip exactly its 140 moving frames, 8-camera mix 560.
+
+### fire.mp4 (2560×1440, 29.97 fps, empty locker room with a desk fire from ~13 s)
+
+`scripts/run_fire_test.sh`, mux 2560×1440, clock masked; reference = full-frame 768 on every frame. Fire, detections
+before the tracker:
+
+| | first fire | 1-s windows with fire (reference span) | score median / max |
+|---|---|---|---|
+| full frame, every frame | 13.3 s | 78 % | 0.38 / 0.71 |
+| full frame every 25 frames (default config) | 15.0 s | 62 % | 0.39 / 0.61 |
+| + fire/smoke also from the mosaics (`--set mosaic-classes=0;4;5`) | 13.3 s | 98 % | 0.42 / 0.83 |
+
+- The zoomed mosaics find the small early fire (30–90 s) that the full frame misses; every mosaic fire box is on the
+  real fire. On camera-1 the mosaic gave a weak false fire on hair (≤ 0.46), so fire from mosaics needs a higher
+  threshold or more footage before it is switched on.
+- After the production tracker (with `full-frame-hold`) fire is visible in 39 % of seconds (default) / 67 % (fire
+  from mosaics): `minDetectorConfidence: 0.4` drops most fire detections, which score around 0.4 here — the same
+  happens to the production pipeline. Fire/smoke rules should read detections before the tracker or use a lower
+  tracker threshold.
+- No people in the video: weak person false positives (jacket on a locker; full frame 17, mosaic 82, all ≤ 0.6) are
+  all removed by the tracker. 86 fps for one 1440p camera; the flickering fire keeps 90 % of frames active.
 
 Known limits: nvdsosd does not print the attribute labels that `yolo_attr_probe.attach` adds as classifier metadata
 (they are in the metadata and the dumps); nvinfer's full-frame ROI shows as a thin green frame border on the OSD;

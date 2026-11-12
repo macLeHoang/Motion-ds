@@ -21,7 +21,7 @@
 using namespace vms_motion;
 
 namespace {
-enum Origin : gint64 { Mosaic = 1, FullFrame = 2 };  // stored in misc_obj_info[0]
+enum Origin : gint64 { Mosaic = 1, FullFrame = 2, Held = 3 };  // stored in misc_obj_info[0]
 
 struct Det {
     NvDsInferInstanceMaskInfo obj{};
@@ -148,7 +148,34 @@ struct FrameOut {
     const FramePlan* plan = nullptr;
     bool mosaic_ran = false;
     std::vector<Det> mosaic, full;
+    bool full_ran = false;
 };
+
+HeldDetection hold(const Det& det) {
+    HeldDetection h;
+    h.class_id = det.obj.classId;
+    h.confidence = det.obj.detectionConfidence;
+    h.mask_width = det.obj.mask_width;
+    h.mask_height = det.obj.mask_height;
+    std::copy(det.box, det.box + 4, h.box);
+    if (det.payload)
+        h.payload.assign(det.payload.get(), det.payload.get() + det.obj.mask_size / sizeof(float));
+    return h;
+}
+
+Det unhold(const HeldDetection& h) {
+    Det det;
+    det.obj.classId = h.class_id;
+    det.obj.detectionConfidence = h.confidence;
+    det.obj.mask_width = h.mask_width;
+    det.obj.mask_height = h.mask_height;
+    det.obj.mask_size = unsigned(h.payload.size() * sizeof(float));
+    det.payload = std::make_unique<float[]>(h.payload.size());
+    std::copy(h.payload.begin(), h.payload.end(), det.payload.get());
+    std::copy(h.box, h.box + 4, det.box);
+    det.origin = Held;
+    return det;
+}
 
 void decode_batch(Context& c, NvDsBatchMeta* batch) {
     const auto& d = c.decoder;
@@ -174,6 +201,7 @@ void decode_batch(Context& c, NvDsBatchMeta* batch) {
             f.plan = plan;
             bool mosaic = int(j) == plan->tensor_slot;
             f.mosaic_ran |= mosaic;
+            f.full_ran |= !mosaic;
             auto dets = parse_slot(d, *outputs, mosaic ? plan->plan : plan->full_plan, plan->source_w,
                                    plan->source_h, mosaic ? Mosaic : FullFrame);
             for (auto& det : dets)
@@ -209,6 +237,14 @@ void decode_batch(Context& c, NvDsBatchMeta* batch) {
             if (keep)
                 kept.push_back(std::move(det));
         }
+        if (d.hold_full && f.full_ran) {  // this full frame replaces the source's held detections
+            std::vector<HeldDetection> fresh;
+            for (std::size_t i = from_mosaic; i < kept.size(); ++i)
+                if (kept[i].obj.classId < d.full_classes.size() && d.full_classes[kept[i].obj.classId])
+                    fresh.push_back(hold(kept[i]));
+            std::lock_guard<std::mutex> lock(c.held_mutex);
+            c.held[frame->source_id] = std::move(fresh);
+        }
         for (const auto& det : kept)
             attach(batch, frame, det, d);
         // nvinfer sets this only when it parses objects itself; nvtracker associates a frame's objects only when set.
@@ -217,6 +253,17 @@ void decode_batch(Context& c, NvDsBatchMeta* batch) {
         std::lock_guard<std::mutex> lock(c.feedback_mutex);  // applied by the next CustomTensorPreparation
         c.feedback.push_back({frame->source_id, std::uint64_t(frame->frame_num), f.mosaic_ran, std::move(persons),
                               std::move(seeds)});
+    }
+    if (!d.hold_full)
+        return;
+    std::lock_guard<std::mutex> lock(c.held_mutex);
+    for (auto* l = batch->frame_meta_list; l; l = l->next) {  // every frame without its own full frame
+        auto* frame = static_cast<NvDsFrameMeta*>(l->data);
+        auto f = frames.find(frame);
+        auto h = c.held.find(frame->source_id);
+        if ((f == frames.end() || !f->second.full_ran) && h != c.held.end())
+            for (const auto& held : h->second)
+                attach(batch, frame, unhold(held), d);
     }
 }
 }

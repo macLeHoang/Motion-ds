@@ -26,9 +26,18 @@ struct DecoderConfig {
     float det_score = .25f, dedupe_iou = .5f;
     std::vector<bool> mosaic_classes;  // kept from mosaic slots; their full-frame boxes seed regions
     std::vector<bool> full_classes;    // kept from full-frame slots
+    bool hold_full = false;            // re-attach full-frame-class detections until the next full frame
     std::vector<std::string> labels;
     void* parser_lib = nullptr;        // dlopen handle
     void* parse = nullptr;             // NvDsInferParseCustomFunc-style instance-mask parser, e.g. NvDsInferYoloAttr
+};
+
+// A full-frame-class detection from a source's last full frame, re-attached to its frames until the next full frame
+// (full-frame-hold): with detections only every N frames, nvtracker would end those tracks before they are confirmed.
+struct HeldDetection {
+    unsigned class_id = 0, mask_width = 0, mask_height = 0;
+    float confidence = 0, box[4]{};
+    std::vector<float> payload;
 };
 
 // Detector feedback for one frame, queued by the decode probe for Processor::feedback.
@@ -51,6 +60,8 @@ struct Context {
     std::mutex mutex;
     std::mutex feedback_mutex;
     std::vector<Feedback> feedback;
+    std::mutex held_mutex;  // decode probe only
+    std::unordered_map<unsigned, std::vector<HeldDetection>> held;  // by source id
     std::string preview_dir;
     std::string preview_session;
     double preview_fps = 1;

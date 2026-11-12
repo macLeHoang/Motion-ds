@@ -13,5 +13,7 @@ COMMON=(--config configs/app.yaml --mux 2560x1440 --set "$MASK" --input "$V")
 python3 app/motion_ds_app.py "${COMMON[@]}" --output runs/fire_default > runs/fire_default.log 2>&1
 python3 app/motion_ds_app.py "${COMMON[@]}" --set "mosaic-classes=0;4;5" --output runs/fire_mosaic_fire \
     > runs/fire_mosaic_fire.log 2>&1
-python3 analysis/fire_timeline.py --fps 29.97 full768="$BASELINE" default=runs/fire_default/fire_engine_dets.jsonl \
-    mosaic_fire=runs/fire_mosaic_fire/fire_engine_dets.jsonl | tee runs/fire_timeline.md
+T=(full768="$BASELINE" default=runs/fire_default/fire_engine_dets.jsonl
+   mosaic_fire=runs/fire_mosaic_fire/fire_engine_dets.jsonl)
+python3 analysis/fire_timeline.py --fps 29.97 "${T[@]}" | tee runs/fire_timeline.md          # new detections only
+python3 analysis/fire_timeline.py --fps 29.97 --include-held "${T[@]}" > runs/fire_timeline_with_held.md  # as rules see

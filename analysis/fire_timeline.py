@@ -14,14 +14,14 @@ import json
 import numpy as np
 
 
-def load(path: str, classes: list[str], min_score: float) -> dict:
-    """class -> {frame: max score} and the number of frames in the file."""
+def load(path: str, classes: list[str], min_score: float, held: bool) -> dict:
+    """class -> {frame: max score} and the number of frames in the file; `held` keeps re-attached copies."""
     out, frames = {c: {} for c in classes}, 0
     for line in open(path):
         r = json.loads(line)
         frames = max(frames, r["frame"] + 1)
         for d in r["dets"]:
-            if d["cls"] in out and d["score"] >= min_score:
+            if d["cls"] in out and d["score"] >= min_score and (held or d.get("origin") != "held"):
                 out[d["cls"]][r["frame"]] = max(out[d["cls"]].get(r["frame"], 0), d["score"])
     return out, frames
 
@@ -38,8 +38,10 @@ def main():
     ap.add_argument("--classes", nargs="+", default=["fire", "smoke"])
     ap.add_argument("--score", type=float, default=0.25)
     ap.add_argument("--bin", type=float, default=10.0, help="timeline bin in seconds")
+    ap.add_argument("--include-held", action="store_true",
+                    help="count held full-frame detections (what a rule after the tracker sees), not only new ones")
     a = ap.parse_args()
-    runs = [(r.split("=", 1)[0], *load(r.split("=", 1)[1], a.classes, a.score)) for r in a.runs]
+    runs = [(r.split("=", 1)[0], *load(r.split("=", 1)[1], a.classes, a.score, a.include_held)) for r in a.runs]
     n = max(f for _, _, f in runs)
     out = []
     for c in a.classes:
