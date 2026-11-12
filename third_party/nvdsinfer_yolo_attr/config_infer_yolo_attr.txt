@@ -1,0 +1,27 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+# nvinfer config for a trt_nms engine with keypoints, attributes or children, parsed by NvDsInferYoloAttr.
+# Network type 3 (instance segmentation) only lets the parser attach its per-object payload; nothing is a mask.
+
+[property]
+gpu-id=0
+gie-unique-id=1
+process-mode=1
+model-engine-file=ialy_v9_clean_erd_m_last-trt.engine
+labelfile-path=labels.txt
+batch-size=4
+num-detected-classes=81
+# Input as in Ultralytics: RGB, 0-1, letterbox centered on the frame
+model-color-format=0
+net-scale-factor=0.0039215697906911373
+maintain-aspect-ratio=1
+symmetric-padding=1
+# NMS already ran in the engine
+cluster-mode=4
+network-type=3
+output-instance-mask=1
+parse-bbox-instance-mask-func-name=NvDsInferYoloAttr
+custom-lib-path=/opt/nvidia/deepstream/deepstream/lib/libnvds_infer_yolo_attr.so
+
+[class-attrs-all]
+pre-cluster-threshold=0.25
+topk=300

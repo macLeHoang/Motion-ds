@@ -1,0 +1,4 @@
+build*/
+motion-preview/
+runtime-results/
+__pycache__/
