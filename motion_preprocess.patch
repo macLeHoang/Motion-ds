@@ -1,0 +1,1208 @@
+diff --git a/dls/core/motion.py b/dls/core/motion.py
+index c7d9c52..81c33b6 100644
+--- a/dls/core/motion.py
++++ b/dls/core/motion.py
+@@ -82,6 +82,7 @@ class MotionDetector:
+         self._stale = np.zeros((self.h, self.w), np.uint16)
+         self._protected = np.zeros((self.h, self.w), bool)
+         self._frames = 0
++        self._seen = 0  # frames since the last reset, for the contrast warm-up
+         self.relearned_px = 0
+         self.rebases = 0
+ 
+@@ -106,7 +107,11 @@ class MotionDetector:
+                 boxes.append((int(x * f), int(y * f), int((x + w) * f), int((y + h) * f)))
+ 
+         pct_motion = total_area / (self.h * self.w)
+-        if pct_motion < 0.05 and len(boxes) <= 4:
++        # The (0, 255) contrast seed keeps changing the stretched image until the history is full, which reads as
++        # motion on a static scene: calibration ends only once every history entry comes from real frames.
++        self._seen += 1
++        settled = not self.improve_contrast or self._seen >= len(self.contrast_values)
++        if pct_motion < 0.05 and len(boxes) <= 4 and settled:
+             self.calibrating = False
+         if self.calibrating or pct_motion > self.lightning_threshold:
+             self.calibrating = True
+diff --git a/native/motion_preprocess/CMakeLists.txt b/native/motion_preprocess/CMakeLists.txt
+index 5c9066f..10e364a 100644
+--- a/native/motion_preprocess/CMakeLists.txt
++++ b/native/motion_preprocess/CMakeLists.txt
+@@ -20,7 +20,7 @@ endif()
+ 
+ find_package(OpenCV QUIET COMPONENTS core imgproc imgcodecs)
+ if(OpenCV_FOUND)
+-  add_library(vms_motion_core STATIC src/motion.cpp src/processor.cpp)
++  add_library(vms_motion_core STATIC src/motion.cpp src/processor.cpp src/regions.cpp)
+   target_include_directories(vms_motion_core PUBLIC include ${OpenCV_INCLUDE_DIRS})
+   target_link_libraries(vms_motion_core PUBLIC vms_geometry ${OpenCV_LIBS})
+   target_compile_options(vms_motion_core PRIVATE -Wall -Wextra -Wpedantic)
+@@ -28,6 +28,9 @@ if(OpenCV_FOUND)
+     add_executable(vms_motion_test tests/motion_test.cpp)
+     target_link_libraries(vms_motion_test PRIVATE vms_motion_core)
+     add_test(NAME motion COMMAND vms_motion_test)
++    add_executable(vms_regions_test tests/regions_test.cpp)
++    target_link_libraries(vms_regions_test PRIVATE vms_motion_core)
++    add_test(NAME regions COMMAND vms_regions_test)
+     add_executable(vms_motion_oracle tests/motion_oracle.cpp)
+     target_link_libraries(vms_motion_oracle PRIVATE vms_motion_core)
+   endif()
+@@ -57,22 +60,24 @@ if(VMS_WITH_DEEPSTREAM)
+   if(NOT EXISTS "${DS_INCLUDE}/nvdspreprocess_interface.h")
+     message(FATAL_ERROR "DeepStream headers missing in ${DS_INCLUDE}")
+   endif()
+-  foreach(lib nvds_meta nvdsgst_meta nvbufsurface)
++  # nvdsgst_helper holds gst_nvevent_parse_* (the preview's stream events) in DeepStream 8.0
++  foreach(lib nvds_meta nvdsgst_meta nvbufsurface nvdsgst_helper)
+     find_library(DS_${lib} NAMES ${lib} PATHS ${DEEPSTREAM_ROOT}/lib REQUIRED NO_DEFAULT_PATH)
+   endforeach()
+-  add_library(vms_motion_preprocess SHARED src/preprocess.cpp src/metadata.cpp src/gpu.cu)
++  add_library(vms_motion_preprocess SHARED src/preprocess.cpp src/metadata.cpp src/decoder.cpp src/gpu.cu)
+   target_include_directories(vms_motion_preprocess PUBLIC include ${DS_INCLUDE})
+   target_link_libraries(vms_motion_preprocess PUBLIC vms_motion_core PkgConfig::GST
+     CUDA::cudart CUDA::cuda_driver nlohmann_json::nlohmann_json
+-    ${DS_nvds_meta} ${DS_nvdsgst_meta} ${DS_nvbufsurface})
++    ${DS_nvds_meta} ${DS_nvdsgst_meta} ${DS_nvbufsurface} ${CMAKE_DL_LIBS})
+   set_target_properties(vms_motion_preprocess PROPERTIES BUILD_RPATH "${DEEPSTREAM_ROOT}/lib")
+   add_executable(vms_motion_preview src/preview.cpp)
+-  target_link_libraries(vms_motion_preview PRIVATE vms_motion_preprocess)
++  target_link_libraries(vms_motion_preview PRIVATE vms_motion_preprocess ${DS_nvdsgst_helper})
+   target_link_libraries(vms_motion_preview PRIVATE ${CMAKE_DL_LIBS})
+   set_target_properties(vms_motion_preview PROPERTIES BUILD_RPATH "${DEEPSTREAM_ROOT}/lib")
+   if(BUILD_TESTING)
+     add_library(vms_identity_parser SHARED src/identity_parser.cpp)
+-    target_include_directories(vms_identity_parser PRIVATE ${DS_INCLUDE})
++    # nvdsinfer_custom_impl.h pulls TensorRT headers that include cuda_runtime_api.h
++    target_include_directories(vms_identity_parser PRIVATE ${DS_INCLUDE} ${CUDAToolkit_INCLUDE_DIRS})
+     add_executable(vms_gpu_test tests/gpu_test.cpp)
+     target_link_libraries(vms_gpu_test PRIVATE vms_motion_preprocess)
+     add_test(NAME gpu COMMAND vms_gpu_test)
+diff --git a/native/motion_preprocess/include/vms_motion/metadata.hpp b/native/motion_preprocess/include/vms_motion/metadata.hpp
+index d10ce3f..4e1185d 100644
+--- a/native/motion_preprocess/include/vms_motion/metadata.hpp
++++ b/native/motion_preprocess/include/vms_motion/metadata.hpp
+@@ -17,4 +17,10 @@ bool vms_motion_reset_source(unsigned component_id, unsigned source_id);
+ // Attach to nvdspreprocess's src pad before a tensor-input nvinfer.
+ // The stock plugin may attach an NvDsPreProcessBatchMeta with tensor_meta == nullptr.
+ GstPadProbeReturn vms_motion_strip_empty_tensors(GstPad*, GstPadProbeInfo*, gpointer);
++// Attach to the tensor-input nvinfer's src pad (output-tensor-meta=1, network-type=100), probe data =
++// GUINT_TO_POINTER(component_id). Parses every mosaic / full-frame slot with the configured parser-lib, adds frame-pixel
++// objects (payload in mask_params, origin in misc_obj_info[0]: 1 mosaic, 2 full frame) and feeds regions back.
++GstPadProbeReturn vms_motion_decode_probe(GstPad*, GstPadProbeInfo*, gpointer);
++// Installs vms_motion_strip_empty_tensors and vms_motion_decode_probe; for callers without C function pointers (Python).
++bool vms_motion_install_probes(GstPad* preprocess_src, GstPad* infer_src, unsigned component_id);
+ }
+diff --git a/native/motion_preprocess/include/vms_motion/motion.hpp b/native/motion_preprocess/include/vms_motion/motion.hpp
+index 6c0fb20..da90284 100644
+--- a/native/motion_preprocess/include/vms_motion/motion.hpp
++++ b/native/motion_preprocess/include/vms_motion/motion.hpp
+@@ -45,7 +45,7 @@ public:
+ private:
+     cv::Mat prepare(cv::Mat small, bool update = true);
+     void relearn(const cv::Mat& small, const cv::Mat& prepared, const cv::Mat& delta);
+-    int width_, height_, sw_, sh_, history_index_ = 0, motion_count_ = 0, frames_ = 0;
++    int width_, height_, sw_, sh_, history_index_ = 0, motion_count_ = 0, frames_ = 0, observed_ = 0;
+     MotionConfig config_;
+     cv::Mat average_, mask_, previous_, stale_, protected_;
+     std::vector<cv::Vec2b> contrast_;
+diff --git a/native/motion_preprocess/include/vms_motion/processor.hpp b/native/motion_preprocess/include/vms_motion/processor.hpp
+index e25cf69..c527fb2 100644
+--- a/native/motion_preprocess/include/vms_motion/processor.hpp
++++ b/native/motion_preprocess/include/vms_motion/processor.hpp
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "motion.hpp"
++#include "regions.hpp"
+ 
+ #include <memory>
+ #include <unordered_map>
+@@ -21,20 +22,28 @@ struct Config {
+     int canvas_w = 640, canvas_h = 640, gap = 4;
+     double padding = .15, max_zoom = 2, merge_growth = 1.3;
+     std::unordered_map<unsigned, std::vector<Polygon>> source_masks;
++    int full_interval = 0;     // N: a full-frame slot every N frames per source; 0 = never
++    bool full_stagger = true;  // offset each source by source_id % N so sources take turns
++    RegionConfig regions;
+ };
+ 
+ struct FramePlan {
+-    unsigned version = 1, component_id = 0, source_id = 0;
++    unsigned version = 2, component_id = 0, source_id = 0;
+     std::uint64_t frame_num = 0, pts = 0;
+-    int source_w = 0, source_h = 0, tensor_slot = -1;
+-    Status status = Status::Calibrating;
+-    Plan plan;
++    int source_w = 0, source_h = 0;
++    Status status = Status::Calibrating;  // of the mosaic; Active means `plan` holds crops
++    int tensor_slot = -1;                 // mosaic slot in the tensor, -1 when skipped
++    Plan plan;                            // mosaic placements
++    int full_slot = -1;                   // full-frame slot in the tensor, -1 when not due
++    Plan full_plan;                       // one tile covering the whole frame: the plain letterbox
++    int motion_boxes = 0, regions = 0;    // crop sources before merging, for logs
+     double motion_ms = 0, packing_ms = 0, tensor_ms = 0;
+ };
+ 
+ class Processor {
+ public:
+     explicit Processor(Config config);
++    // Motion boxes plus the source's person regions -> mosaic plan; also the full-frame plan when it is due.
+     FramePlan process(
+         unsigned source,
+         std::uint64_t frame,
+@@ -43,6 +52,19 @@ public:
+         int height,
+         const cv::Mat& small_gray
+     );
++    // Detector feedback for one frame of a source; `mosaic_inferred` says whether its mosaic slot ran.
++    void feedback(
++        unsigned source,
++        std::uint64_t frame,
++        bool mosaic_inferred,
++        const std::vector<Detection>& mosaic_persons,
++        const std::vector<Detection>& full_persons
++    );
++    bool full_frame_due(unsigned source, std::uint64_t frame) const;
++
++    const Config& config() const {
++        return config_;
++    }
+ 
+     void reset_source(unsigned source) {
+         sources_.erase(source);
+@@ -55,6 +77,7 @@ public:
+ private:
+     struct State {
+         std::unique_ptr<MotionDetector> motion;
++        std::unique_ptr<RegionTracker> regions;
+         int width = 0, height = 0;
+         std::uint64_t frame = 0, pts = 0;
+     };
+diff --git a/native/motion_preprocess/include/vms_motion/regions.hpp b/native/motion_preprocess/include/vms_motion/regions.hpp
+new file mode 100644
+index 0000000..9298e9b
+--- /dev/null
++++ b/native/motion_preprocess/include/vms_motion/regions.hpp
+@@ -0,0 +1,53 @@
++#pragma once
++
++#include "geometry.hpp"
++
++#include <cstdint>
++#include <vector>
++
++namespace vms_motion {
++// Person regions kept from detector feedback, so people who stop moving stay in the mosaic.
++struct RegionConfig {
++    int max_misses = 25;          // mosaic inferences without a person inside before a region is removed
++    double padding = .2;          // growth of a region box when it becomes a crop
++    double match_iou = .3;        // detection <-> region match (a detection centre inside also matches)
++    double region_score = .5;     // mosaic person score that refreshes or creates a region
++    double seed_score = .5;       // full-frame person score that refreshes or creates a region
++    int max_regions = 16;         // per source
++};
++
++struct Detection {
++    Box box;
++    float score = 0;
++};
++
++struct Region {
++    Box box;                      // last matched detection, frame pixels
++    int misses = 0;
++    std::uint64_t created = 0, last_hit = 0;
++};
++
++class RegionTracker {
++public:
++    explicit RegionTracker(RegionConfig config = {});
++    // Persons found in one inferred mosaic: refresh or create regions; every region without a hit misses once.
++    void update_mosaic(std::uint64_t frame, const std::vector<Detection>& persons);
++    // Persons found in a full frame: refresh or create regions, never count misses.
++    void seed(std::uint64_t frame, const std::vector<Detection>& persons);
++    // Region boxes grown by the padding and clipped to the frame, ready to merge with motion boxes.
++    std::vector<Box> crops(int width, int height) const;
++
++    const std::vector<Region>& regions() const {
++        return regions_;
++    }
++
++    void clear() {
++        regions_.clear();
++    }
++
++private:
++    std::vector<bool> match(std::uint64_t frame, const std::vector<Detection>& persons, double min_score);
++    RegionConfig config_;
++    std::vector<Region> regions_;
++};
++}
+diff --git a/native/motion_preprocess/src/context.hpp b/native/motion_preprocess/src/context.hpp
+new file mode 100644
+index 0000000..2ed7944
+--- /dev/null
++++ b/native/motion_preprocess/src/context.hpp
+@@ -0,0 +1,71 @@
++#pragma once
++// Internal: the state of one nvdspreprocess component, shared by the tensor preparation (preprocess.cpp) and the
++// decode probe on the following nvinfer (decoder.cpp).
++// Locking: `mutex` guards processor, gpu and preview state and is held by the tensor preparation, also while it waits
++// for a free tensor buffer. Tensor buffers come back only after nvinfer's output has passed the decode probe, so the
++// probe must never take `mutex`: it only appends to `feedback` (under `feedback_mutex`), which the tensor preparation
++// applies at the start of the next batch.
++
++#include "vms_motion/gpu.hpp"
++#include "vms_motion/processor.hpp"
++
++#include <array>
++#include <fstream>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++#include <dlfcn.h>
++
++namespace vms_motion {
++struct DecoderConfig {
++    unsigned infer_id = 2;            // gie-unique-id of the nvinfer reading this component's tensors
++    int num_classes = 81;
++    float det_score = .25f, dedupe_iou = .5f;
++    std::vector<bool> mosaic_classes;  // kept from mosaic slots; their full-frame boxes seed regions
++    std::vector<bool> full_classes;    // kept from full-frame slots
++    std::vector<std::string> labels;
++    void* parser_lib = nullptr;        // dlopen handle
++    void* parse = nullptr;             // NvDsInferParseCustomFunc-style instance-mask parser, e.g. NvDsInferYoloAttr
++};
++
++// Detector feedback for one frame, queued by the decode probe for Processor::feedback.
++struct Feedback {
++    unsigned source = 0;
++    std::uint64_t frame = 0;
++    bool mosaic_ran = false;
++    std::vector<Detection> persons, seeds;
++};
++
++struct Context {
++    unsigned id = 0;
++    int device = 0, capacity = 0;
++    Config config;
++    DecoderConfig decoder;
++    bool fp16 = false, bgr = false;
++    std::array<float, 3> scale{1.f / 255, 1.f / 255, 1.f / 255}, offset{0, 0, 0};
++    std::unique_ptr<Processor> processor;
++    std::unique_ptr<Gpu> gpu;
++    std::mutex mutex;
++    std::mutex feedback_mutex;
++    std::vector<Feedback> feedback;
++    std::string preview_dir;
++    std::string preview_session;
++    double preview_fps = 1;
++    std::uint64_t preview_seq = 0;
++    std::unordered_map<unsigned, double> last_preview;
++    std::ofstream events;
++
++    ~Context() {
++        cudaSetDevice(device);
++        gpu.reset();
++        if (decoder.parser_lib)
++            dlclose(decoder.parser_lib);
++    }
++};
++
++// The live context of a component id, or nullptr.
++std::shared_ptr<Context> find_context(unsigned component_id);
++}
+diff --git a/native/motion_preprocess/src/decoder.cpp b/native/motion_preprocess/src/decoder.cpp
+new file mode 100644
+index 0000000..ef2ad5f
+--- /dev/null
++++ b/native/motion_preprocess/src/decoder.cpp
+@@ -0,0 +1,253 @@
++// Decode probe for the nvinfer that reads this library's tensors (input-tensor-from-meta=1, network-type=100,
++// output-tensor-meta=1). For every tensor slot it runs the configured instance-mask parser (NvDsInferYoloAttr) on the
++// slot's outputs, maps the boxes from canvas to frame pixels through the slot's plan, keeps the configured classes,
++// removes cross-crop duplicates, attaches the objects like nvinfer would (payload in mask_params), and feeds the
++// person boxes back to the source's region tracker.
++
++#include "context.hpp"
++#include "vms_motion/metadata.hpp"
++
++#include <algorithm>
++#include <cstring>
++#include <iostream>
++#include <map>
++#include <memory>
++
++#include <gstnvdsinfer.h>
++#include <gstnvdsmeta.h>
++#include <nvdsinfer_custom_impl.h>
++#include <nvdspreprocess_meta.h>
++
++using namespace vms_motion;
++
++namespace {
++enum Origin : gint64 { Mosaic = 1, FullFrame = 2 };  // stored in misc_obj_info[0]
++
++struct Det {
++    NvDsInferInstanceMaskInfo obj{};
++    std::unique_ptr<float[]> payload;  // the parser's new[] allocation
++    float box[4]{};                    // frame pixels x1, y1, x2, y2
++    Origin origin = Mosaic;
++};
++
++float area(const float* b) {
++    return std::max(0.f, b[2] - b[0]) * std::max(0.f, b[3] - b[1]);
++}
++
++// Same label and IoU >= iou_min, or one box 80 % inside the other (dls/core/regions.py dedupe_detections).
++bool duplicate(const Det& a, const Det& b, float iou_min) {
++    if (a.obj.classId != b.obj.classId)
++        return false;
++    float iw = std::max(0.f, std::min(a.box[2], b.box[2]) - std::max(a.box[0], b.box[0])),
++          ih = std::max(0.f, std::min(a.box[3], b.box[3]) - std::max(a.box[1], b.box[1])), inter = iw * ih,
++          aa = area(a.box), ab = area(b.box);
++    return inter / (aa + ab - inter + 1e-9f) >= iou_min || inter >= .8f * std::min(aa, ab);
++}
++
++// Canvas box -> frame pixels through the tile holding its centre (geometry.cpp map_box, without clipping to the crop
++// so the box-relative payload stays exact); clipped to the frame as nvinfer does. False when the centre is in a gap.
++bool to_frame(const Plan& p, int w, int h, const NvDsInferInstanceMaskInfo& o, float* out) {
++    double cx = (o.left + o.width / 2 - p.pad_x) / p.scale_x, cy = (o.top + o.height / 2 - p.pad_y) / p.scale_y;
++    for (const auto& t : p.tiles) {
++        if (cx < t.x || cx >= t.x + t.w || cy < t.y || cy >= t.y + t.h)
++            continue;
++        auto lo = map_point(p, t, o.left, o.top), hi = map_point(p, t, o.left + o.width, o.top + o.height);
++        out[0] = float(std::clamp(lo[0], 0., double(w)));
++        out[1] = float(std::clamp(lo[1], 0., double(h)));
++        out[2] = float(std::clamp(hi[0], 0., double(w)));
++        out[3] = float(std::clamp(hi[1], 0., double(h)));
++        return out[2] > out[0] && out[3] > out[1];
++    }
++    return false;
++}
++
++NvDsInferTensorMeta* slot_outputs(NvDsRoiMeta& roi, unsigned infer_id) {
++    for (auto* l = roi.roi_user_meta_list; l; l = l->next) {
++        auto* u = static_cast<NvDsUserMeta*>(l->data);
++        if (u->base_meta.meta_type == NVDSINFER_TENSOR_OUTPUT_META) {
++            auto* t = static_cast<NvDsInferTensorMeta*>(u->user_meta_data);
++            if (t && t->unique_id == infer_id)
++                return t;
++        }
++    }
++    return nullptr;
++}
++
++// Runs the parser on one slot and keeps the detections whose centre lands in a tile of `plan`.
++std::vector<Det> parse_slot(const DecoderConfig& d, const NvDsInferTensorMeta& t, const Plan& plan, int w, int h,
++                            Origin origin) {
++    std::vector<NvDsInferLayerInfo> layers(t.output_layers_info, t.output_layers_info + t.num_output_layers);
++    for (unsigned i = 0; i < t.num_output_layers; ++i)
++        layers[i].buffer = t.out_buf_ptrs_host[i];
++    NvDsInferNetworkInfo net{unsigned(plan.canvas_w), unsigned(plan.canvas_h), 3};
++    NvDsInferParseDetectionParams params;
++    params.numClassesConfigured = unsigned(d.num_classes);
++    params.perClassPreclusterThreshold.assign(d.num_classes, d.det_score);
++    params.perClassPostclusterThreshold.assign(d.num_classes, 0.f);
++    std::vector<NvDsInferInstanceMaskInfo> objects;
++    auto parse = reinterpret_cast<NvDsInferInstanceMaskParseCustomFunc>(d.parse);
++    bool ok = parse(layers, net, params, objects);
++    std::vector<Det> out;
++    for (auto& o : objects) {
++        Det det;
++        det.obj = o;
++        det.payload.reset(o.mask);
++        det.origin = origin;
++        if (ok && to_frame(plan, w, h, o, det.box))
++            out.push_back(std::move(det));
++    }
++    if (!ok)
++        throw std::runtime_error("parser-func rejected the engine outputs");
++    return out;
++}
++
++void attach(NvDsBatchMeta* batch, NvDsFrameMeta* frame, const Det& det, const DecoderConfig& d) {
++    auto* obj = nvds_acquire_obj_meta_from_pool(batch);
++    const auto& o = det.obj;
++    obj->unique_component_id = int(d.infer_id);
++    obj->class_id = int(o.classId);
++    obj->confidence = o.detectionConfidence;
++    obj->object_id = UNTRACKED_OBJECT_ID;
++    obj->misc_obj_info[0] = det.origin;
++    auto& r = obj->rect_params;
++    r.left = det.box[0];
++    r.top = det.box[1];
++    r.width = det.box[2] - det.box[0];
++    r.height = det.box[3] - det.box[1];
++    r.border_width = 2;
++    r.border_color = det.origin == Mosaic ? NvOSD_ColorParams{0, 1, 0, 1} : NvOSD_ColorParams{1, .5, 0, 1};
++    obj->detector_bbox_info.org_bbox_coords = {r.left, r.top, r.width, r.height};
++    std::string label = o.classId < d.labels.size() ? d.labels[o.classId] : std::to_string(o.classId);
++    g_strlcpy(obj->obj_label, label.c_str(), MAX_LABEL_SIZE);
++    auto& text = obj->text_params;
++    text.display_text = g_strdup_printf("%s %.2f", label.c_str(), o.detectionConfidence);
++    text.x_offset = unsigned(std::max(0.f, r.left));
++    text.y_offset = unsigned(std::max(0.f, r.top - 10));
++    text.font_params.font_name = const_cast<gchar*>("Serif");
++    text.font_params.font_size = 11;
++    text.font_params.font_color = {1, 1, 1, 1};
++    text.set_bg_clr = 1;
++    text.text_bg_clr = {0, 0, 0, 1};
++    if (det.payload && o.mask_size) {
++        auto* payload = static_cast<float*>(g_malloc(o.mask_size));  // freed with the object meta, as nvinfer's
++        std::memcpy(payload, det.payload.get(), o.mask_size);
++        obj->mask_params.data = payload;
++        obj->mask_params.size = o.mask_size;
++        obj->mask_params.width = o.mask_width;
++        obj->mask_params.height = o.mask_height;
++        obj->mask_params.threshold = 0;
++    }
++    nvds_add_obj_meta_to_frame(frame, obj, nullptr);
++}
++
++Box int_box(const float* b) {
++    return {int(b[0]), int(b[1]), int(b[2]), int(b[3])};
++}
++
++struct FrameOut {
++    const FramePlan* plan = nullptr;
++    bool mosaic_ran = false;
++    std::vector<Det> mosaic, full;
++};
++
++void decode_batch(Context& c, NvDsBatchMeta* batch) {
++    const auto& d = c.decoder;
++    if (!d.parse)
++        throw std::invalid_argument("decode probe installed but parser-lib is not configured");
++    std::map<NvDsFrameMeta*, FrameOut> frames;
++    for (auto* l = batch->batch_user_meta_list; l; l = l->next) {
++        auto* user = static_cast<NvDsUserMeta*>(l->data);
++        if (user->base_meta.meta_type != NVDS_PREPROCESS_BATCH_META)
++            continue;
++        auto* pre = static_cast<GstNvDsPreProcessBatchMeta*>(user->user_meta_data);
++        if (!pre || !pre->tensor_meta)
++            continue;
++        for (std::size_t j = 0; j < pre->roi_vector.size(); ++j) {
++            auto& roi = pre->roi_vector[j];
++            const auto* plan = roi.frame_meta ? frame_plan(roi.frame_meta, c.id) : nullptr;
++            if (!plan || (int(j) != plan->tensor_slot && int(j) != plan->full_slot))
++                continue;  // another component's tensor
++            auto* outputs = slot_outputs(roi, d.infer_id);
++            if (!outputs)
++                throw std::runtime_error("no nvinfer output for a tensor slot (check infer-unique-id)");
++            auto& f = frames[roi.frame_meta];
++            f.plan = plan;
++            bool mosaic = int(j) == plan->tensor_slot;
++            f.mosaic_ran |= mosaic;
++            auto dets = parse_slot(d, *outputs, mosaic ? plan->plan : plan->full_plan, plan->source_w,
++                                   plan->source_h, mosaic ? Mosaic : FullFrame);
++            for (auto& det : dets)
++                (mosaic ? f.mosaic : f.full).push_back(std::move(det));
++        }
++    }
++    auto by_score = [](const Det& a, const Det& b) { return a.obj.detectionConfidence > b.obj.detectionConfidence; };
++    for (auto& [frame, f] : frames) {
++        std::vector<Det> kept;
++        std::vector<Detection> persons, seeds;
++        std::stable_sort(f.mosaic.begin(), f.mosaic.end(), by_score);
++        for (auto& det : f.mosaic) {
++            bool keep = det.obj.classId < d.mosaic_classes.size() && d.mosaic_classes[det.obj.classId] &&
++                        std::none_of(kept.begin(), kept.end(), [&](const Det& k) {
++                            return duplicate(det, k, d.dedupe_iou);
++                        });
++            if (keep) {
++                persons.push_back({int_box(det.box), det.obj.detectionConfidence});
++                kept.push_back(std::move(det));
++            }
++        }
++        const std::size_t from_mosaic = kept.size();
++        for (auto& det : f.full) {
++            auto c_id = det.obj.classId;
++            bool region_class = c_id < d.mosaic_classes.size() && d.mosaic_classes[c_id];
++            if (region_class)
++                seeds.push_back({int_box(det.box), det.obj.detectionConfidence});
++            // Full-frame boxes of the mosaic classes only where the mosaic has none (people not yet in a region).
++            bool keep = (c_id < d.full_classes.size() && d.full_classes[c_id]) ||
++                        (region_class && std::none_of(kept.begin(), kept.begin() + from_mosaic, [&](const Det& k) {
++                             return duplicate(det, k, d.dedupe_iou);
++                         }));
++            if (keep)
++                kept.push_back(std::move(det));
++        }
++        for (const auto& det : kept)
++            attach(batch, frame, det, d);
++        // nvinfer sets this only when it parses objects itself; nvtracker associates a frame's objects only when set.
++        // Frames without a slot keep it unset, so the tracker predicts through them instead of counting misses.
++        frame->bInferDone = TRUE;
++        std::lock_guard<std::mutex> lock(c.feedback_mutex);  // applied by the next CustomTensorPreparation
++        c.feedback.push_back({frame->source_id, std::uint64_t(frame->frame_num), f.mosaic_ran, std::move(persons),
++                              std::move(seeds)});
++    }
++}
++}
++
++extern "C" GstPadProbeReturn vms_motion_decode_probe(GstPad* pad, GstPadProbeInfo* info, gpointer component) {
++    if (!(GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER))
++        return GST_PAD_PROBE_OK;
++    auto* buffer = GST_PAD_PROBE_INFO_BUFFER(info);
++    auto* batch = buffer ? gst_buffer_get_nvds_batch_meta(buffer) : nullptr;
++    auto c = batch ? find_context(GPOINTER_TO_UINT(component)) : nullptr;
++    if (!c)
++        return GST_PAD_PROBE_OK;
++    try {
++        decode_batch(*c, batch);  // reads only immutable config and frame metadata; never takes c->mutex
++    } catch (const std::exception& e) {
++        std::cerr << "vms motion decode: " << e.what() << '\n';
++        if (auto* owner = pad ? gst_pad_get_parent_element(pad) : nullptr) {
++            GST_ELEMENT_ERROR(owner, STREAM, FAILED, ("Motion mosaic decode failed"), ("%s", e.what()));
++            gst_object_unref(owner);
++        }
++        return GST_PAD_PROBE_DROP;
++    }
++    return GST_PAD_PROBE_OK;
++}
++
++extern "C" bool vms_motion_install_probes(GstPad* preprocess_src, GstPad* infer_src, unsigned component) {
++    if (!preprocess_src || !infer_src || !component)
++        return false;
++    gst_pad_add_probe(preprocess_src, GST_PAD_PROBE_TYPE_BUFFER, vms_motion_strip_empty_tensors,
++                      GUINT_TO_POINTER(component), nullptr);
++    gst_pad_add_probe(infer_src, GST_PAD_PROBE_TYPE_BUFFER, vms_motion_decode_probe, GUINT_TO_POINTER(component),
++                      nullptr);
++    return true;
++}
+diff --git a/native/motion_preprocess/src/metadata.cpp b/native/motion_preprocess/src/metadata.cpp
+index 09f2f37..5e8fd05 100644
+--- a/native/motion_preprocess/src/metadata.cpp
++++ b/native/motion_preprocess/src/metadata.cpp
+@@ -7,7 +7,7 @@
+ 
+ namespace vms_motion {
+ NvDsMetaType placement_meta_type() {
+-    static gchar name[] = "VMS.MOTION_MOSAIC.PLACEMENTS.V1";
++    static gchar name[] = "VMS.MOTION_MOSAIC.PLACEMENTS.V2";  // V2: full-frame slot and regions in FramePlan
+     static auto type = nvds_get_user_meta_type(name);
+     return type;
+ }
+@@ -52,7 +52,7 @@ const FramePlan* frame_plan(const NvDsFrameMeta* frame, unsigned component) {
+         auto* u = static_cast<NvDsUserMeta*>(l->data);
+         if (u->base_meta.meta_type == placement_meta_type()) {
+             auto* p = static_cast<FramePlan*>(u->user_meta_data);
+-            if (p && p->version == 1 && p->component_id == component)
++            if (p && p->version == FramePlan{}.version && p->component_id == component)
+                 return p;
+         }
+     }
+diff --git a/native/motion_preprocess/src/motion.cpp b/native/motion_preprocess/src/motion.cpp
+index ac678f5..36c4d1a 100644
+--- a/native/motion_preprocess/src/motion.cpp
++++ b/native/motion_preprocess/src/motion.cpp
+@@ -47,6 +47,7 @@ void MotionDetector::reset() {
+     calibrating_ = true;
+     motion_count_ = 0;
+     frames_ = 0;
++    observed_ = 0;
+     rebases_ = 0;
+ }
+ 
+@@ -190,7 +191,11 @@ std::vector<Box> MotionDetector::detect_small(const cv::Mat& small) {
+         }
+     }
+     double pct = total / (sw_ * sh_);
+-    if (pct < .05 && boxes.size() <= 4)
++    // The contrast history starts at (0, 255) and keeps changing the normalised image until it is full, which reads as
++    // motion on a static scene; so calibration ends only once every history entry comes from real frames.
++    ++observed_;
++    bool settled = !config_.improve_contrast || observed_ >= config_.history;
++    if (pct < .05 && boxes.size() <= 4 && settled)
+         calibrating_ = false;
+     if (calibrating_ || pct > config_.lightning_threshold)
+         calibrating_ = true;
+diff --git a/native/motion_preprocess/src/preprocess.cpp b/native/motion_preprocess/src/preprocess.cpp
+index 12bfe94..926d732 100644
+--- a/native/motion_preprocess/src/preprocess.cpp
++++ b/native/motion_preprocess/src/preprocess.cpp
+@@ -1,4 +1,4 @@
+-#include "vms_motion/gpu.hpp"
++#include "context.hpp"
+ #include "vms_motion/metadata.hpp"
+ 
+ #include <chrono>
+@@ -19,28 +19,6 @@ using namespace vms_motion;
+ using Json = nlohmann::json;
+ 
+ namespace {
+-struct Context {
+-    unsigned id = 0;
+-    int device = 0, capacity = 0;
+-    Config config;
+-    bool fp16 = false, bgr = false;
+-    std::array<float, 3> scale{1.f / 255, 1.f / 255, 1.f / 255}, offset{0, 0, 0};
+-    std::unique_ptr<Processor> processor;
+-    std::unique_ptr<Gpu> gpu;
+-    std::mutex mutex;
+-    std::string preview_dir;
+-    std::string preview_session;
+-    double preview_fps = 1;
+-    std::uint64_t preview_seq = 0;
+-    std::unordered_map<unsigned, double> last_preview;
+-    std::ofstream events;
+-
+-    ~Context() {
+-        cudaSetDevice(device);
+-        gpu.reset();
+-    }
+-};
+-
+ std::mutex registry_mutex;
+ std::unordered_map<unsigned, std::weak_ptr<Context>> registry;
+ 
+@@ -89,6 +67,29 @@ std::array<float, 3> triple(
+     return fallback;
+ }
+ 
++// Semicolon-separated class ids; a missing key selects every class.
++std::vector<bool> classes(
++    const std::unordered_map<std::string, std::string>& values, const char* key, int count
++) {
++    std::vector<bool> out(count, true);
++    auto it = values.find(key);
++    if (it == values.end())
++        return out;
++    out.assign(count, false);
++    std::istringstream input(it->second);
++    std::string token;
++    while (std::getline(input, token, ';')) {
++        if (token.empty())
++            continue;
++        std::size_t end = 0;
++        int id = std::stoi(token, &end);
++        if (end != token.size() || id < 0 || id >= count)
++            throw std::invalid_argument(std::string("invalid class id in ") + key);
++        out[id] = true;
++    }
++    return out;
++}
++
+ std::vector<Polygon> polygons(const Json& value) {
+     if (!value.is_array())
+         throw std::invalid_argument("masks must be an array of polygons");
+@@ -135,6 +136,11 @@ Json plan_json(const FramePlan& p) {
+         {"scale", Json::array({p.plan.scale_x, p.plan.scale_y})},
+         {"letterbox_offset", Json::array({p.plan.pad_x, p.plan.pad_y})},
+         {"placements", tiles},
++        {"motion_boxes", p.motion_boxes},
++        {"regions", p.regions},
++        {"full_slot", p.full_slot < 0 ? Json(nullptr) : Json(p.full_slot)},
++        {"full_scale", Json::array({p.full_plan.scale_x, p.full_plan.scale_y})},
++        {"full_letterbox_offset", Json::array({p.full_plan.pad_x, p.full_plan.pad_y})},
+         {"timings_ms",
+          {{"motion", p.motion_ms}, {"packing", p.packing_ms}, {"tensor", p.tensor_ms}}}
+     };
+@@ -258,7 +264,24 @@ extern "C" CustomCtx* initLib(CustomInitParams params) {
+             "mask-polygons",
+             "source-masks",
+             "preview-dir",
+-            "preview-fps"
++            "preview-fps",
++            "full-frame-interval",
++            "full-frame-stagger",
++            "region-max-misses",
++            "region-padding",
++            "region-match-iou",
++            "region-score",
++            "seed-score",
++            "max-regions",
++            "infer-unique-id",
++            "num-classes",
++            "det-score",
++            "dedupe-iou",
++            "mosaic-classes",
++            "full-frame-classes",
++            "labels-file",
++            "parser-lib",
++            "parser-func"
+         };
+         for (const auto& item : u)
+             if (!allowed.count(item.first))
+@@ -296,6 +319,43 @@ extern "C" CustomCtx* initLib(CustomInitParams params) {
+                 c->config.source_masks[unsigned(source)] = polygons(mask.value());
+             }
+         }
++        c->config.full_interval = integer(u, "full-frame-interval", 0);
++        int stagger = integer(u, "full-frame-stagger", 1);
++        if (stagger != 0 && stagger != 1)
++            throw std::invalid_argument("full-frame-stagger must be 0 or 1");
++        c->config.full_stagger = stagger;
++        auto& r = c->config.regions;
++        r.max_misses = integer(u, "region-max-misses", r.max_misses);
++        r.padding = number(u, "region-padding", r.padding);
++        r.match_iou = number(u, "region-match-iou", r.match_iou);
++        r.region_score = number(u, "region-score", r.region_score);
++        r.seed_score = number(u, "seed-score", r.seed_score);
++        r.max_regions = integer(u, "max-regions", r.max_regions);
++        auto& d = c->decoder;
++        d.infer_id = unsigned(integer(u, "infer-unique-id", int(d.infer_id)));
++        d.num_classes = integer(u, "num-classes", d.num_classes);
++        if (!d.infer_id || d.num_classes < 1)
++            throw std::invalid_argument("infer-unique-id and num-classes must be positive");
++        d.det_score = float(number(u, "det-score", d.det_score));
++        d.dedupe_iou = float(number(u, "dedupe-iou", d.dedupe_iou));
++        d.mosaic_classes = classes(u, "mosaic-classes", d.num_classes);
++        d.full_classes = classes(u, "full-frame-classes", d.num_classes);
++        if (auto it = u.find("labels-file"); it != u.end() && !it->second.empty()) {
++            std::ifstream labels(it->second);
++            if (!labels)
++                throw std::invalid_argument("cannot read labels-file " + it->second);
++            for (std::string line; std::getline(labels, line);)
++                d.labels.push_back(line);
++        }
++        if (auto it = u.find("parser-lib"); it != u.end() && !it->second.empty()) {
++            d.parser_lib = dlopen(it->second.c_str(), RTLD_NOW);
++            if (!d.parser_lib)
++                throw std::invalid_argument(std::string("cannot load parser-lib: ") + dlerror());
++            auto name = u.count("parser-func") ? u.at("parser-func") : std::string("NvDsInferYoloAttr");
++            d.parse = dlsym(d.parser_lib, name.c_str());
++            if (!d.parse)
++                throw std::invalid_argument("parser-func " + name + " not found in parser-lib");
++        }
+         c->processor = std::make_unique<Processor>(c->config);
+         cuda_check(cudaSetDevice(c->device), "select GPU");
+         c->gpu = std::make_unique<Gpu>();
+@@ -335,15 +395,14 @@ extern "C" void deInitLib(CustomCtx* ctx) {
+     delete ctx;
+ }
+ 
++std::shared_ptr<Context> vms_motion::find_context(unsigned component) {
++    std::lock_guard<std::mutex> lock(registry_mutex);
++    auto it = registry.find(component);
++    return it == registry.end() ? nullptr : it->second.lock();
++}
++
+ extern "C" bool vms_motion_reset_source(unsigned component, unsigned source) {
+-    std::shared_ptr<Context> c;
+-    {
+-        std::lock_guard<std::mutex> lock(registry_mutex);
+-        auto it = registry.find(component);
+-        if (it == registry.end())
+-            return false;
+-        c = it->second.lock();
+-    }
++    auto c = find_context(component);
+     if (!c)
+         return false;
+     std::lock_guard<std::mutex> lock(c->mutex);
+@@ -365,6 +424,13 @@ extern "C" NvDsPreProcessStatus CustomTensorPreparation(
+     auto c = ctx->value;
+     std::lock_guard<std::mutex> lock(c->mutex);
+     try {
++        std::vector<Feedback> feedback;
++        {
++            std::lock_guard<std::mutex> queued(c->feedback_mutex);
++            feedback.swap(c->feedback);
++        }
++        for (const auto& f : feedback)
++            c->processor->feedback(f.source, f.frame, f.mosaic_ran, f.persons, f.seeds);
+         cuda_check(cudaSetDevice(c->device), "select GPU");
+         tensor.seq_params.roi_vector.clear();
+         BufferMap mapped(batch->inbuf);
+@@ -404,34 +470,45 @@ extern "C" NvDsPreProcessStatus CustomTensorPreparation(
+             );
+             p.component_id = c->id;
+             p.motion_ms += gray_ms;
+-            if (p.status == Status::Active) {
++            // One tensor slot per plan; nvinfer returns slot j's outputs on roi_vector[j], so a frame may own two.
++            auto write = [&](const Plan& plan) {
++                if (slot >= unsigned(c->capacity))
++                    throw std::invalid_argument(
++                        "mosaic and full-frame slots exceed the network-input-shape batch"
++                    );
+                 if (!buf) {
+                     buf = acquirer->acquire();
+                     if (!buf || !buf->memory_ptr)
+                         throw std::runtime_error("tensor pool exhausted");
+                 }
+-                p.tensor_slot = slot++;
+-                auto started = std::chrono::steady_clock::now();
+                 c->gpu->tensor(
+                     view,
+-                    p.plan,
+-                    static_cast<unsigned char*>(buf->memory_ptr) + p.tensor_slot * sample_bytes,
++                    plan,
++                    static_cast<unsigned char*>(buf->memory_ptr) + slot * sample_bytes,
+                     c->fp16,
+                     c->bgr,
+                     c->scale,
+                     c->offset
+                 );
+-                p.tensor_ms = std::chrono::duration<double, std::milli>(
+-                                  std::chrono::steady_clock::now() - started
+-                )
+-                                  .count();
+                 tensor.seq_params.roi_vector.push_back(unit.roi_meta);
+-            }
++                return int(slot++);
++            };
++            auto started = std::chrono::steady_clock::now();
++            if (p.status == Status::Active)
++                p.tensor_slot = write(p.plan);
++            if (!p.full_plan.tiles.empty())
++                p.full_slot = write(p.full_plan);
++            p.tensor_ms = std::chrono::duration<double, std::milli>(
++                              std::chrono::steady_clock::now() - started
++            )
++                              .count();
+             preview(*c, view, p);
+             plans.push_back(std::move(p));
+         }
+         for (std::size_t i = 0; i < plans.size(); ++i)
+             attach_plan(batch->batch_meta, batch->units[i].frame_meta, plans[i]);
++        if (c->events.is_open())
++            c->events.flush();  // readable while the pipeline runs and complete at EOS
+         tensor.params.network_input_shape = {int(slot), 3, c->config.canvas_h, c->config.canvas_w};
+         tensor.params.buffer_size = slot * sample_bytes;
+         return slot ? NVDSPREPROCESS_SUCCESS : NVDSPREPROCESS_TENSOR_NOT_READY;
+diff --git a/native/motion_preprocess/src/processor.cpp b/native/motion_preprocess/src/processor.cpp
+index 0d5d228..1363fbb 100644
+--- a/native/motion_preprocess/src/processor.cpp
++++ b/native/motion_preprocess/src/processor.cpp
+@@ -16,8 +16,33 @@ Processor::Processor(Config config)
+     if (!std::isfinite(config_.padding) || config_.padding < 0 ||
+         !std::isfinite(config_.merge_growth) || config_.merge_growth < 0)
+         throw std::invalid_argument("invalid padding/merge growth");
++    if (config_.full_interval < 0)
++        throw std::invalid_argument("invalid full-frame interval");
+     pack({}, config_.canvas_w, config_.canvas_h, config_.gap, config_.max_zoom);
+     MotionDetector check(640, 360, config_.motion);
++    RegionTracker regions(config_.regions);
++}
++
++bool Processor::full_frame_due(unsigned source, std::uint64_t frame) const {
++    if (config_.full_interval <= 0)
++        return false;
++    auto n = std::uint64_t(config_.full_interval);
++    return (frame + (config_.full_stagger ? source % n : 0)) % n == 0;
++}
++
++void Processor::feedback(
++    unsigned source,
++    std::uint64_t frame,
++    bool mosaic_inferred,
++    const std::vector<Detection>& mosaic_persons,
++    const std::vector<Detection>& full_persons
++) {
++    auto it = sources_.find(source);
++    if (it == sources_.end() || !it->second.regions)
++        return;  // source was reset since that frame
++    if (mosaic_inferred)
++        it->second.regions->update_mosaic(frame, mosaic_persons);
++    it->second.regions->seed(frame, full_persons);
+ }
+ 
+ FramePlan Processor::process(
+@@ -32,6 +57,7 @@ FramePlan Processor::process(
+         if (masks != config_.source_masks.end())
+             motion_config.masks = masks->second;
+         s.motion = std::make_unique<MotionDetector>(w, h, std::move(motion_config));
++        s.regions = std::make_unique<RegionTracker>(config_.regions);
+         s.width = w;
+         s.height = h;
+     }
+@@ -48,11 +74,16 @@ FramePlan Processor::process(
+     auto start = Clock::now();
+     auto boxes = s.motion->detect_small(small);
+     out.motion_ms = elapsed(start);
+-    if (s.motion->calibrating())
+-        return out;
++    const bool calibrating = s.motion->calibrating();
+     start = Clock::now();
++    if (calibrating)
++        boxes.clear();  // regions still crop while the motion background settles
+     for (auto& b : boxes)
+         b = expand(b, config_.padding, w, h);
++    auto regions = s.regions->crops(w, h);
++    out.motion_boxes = int(boxes.size());
++    out.regions = int(regions.size());
++    boxes.insert(boxes.end(), regions.begin(), regions.end());
+     out.plan = pack(
+         merge(std::move(boxes), config_.merge_growth),
+         config_.canvas_w,
+@@ -60,8 +91,12 @@ FramePlan Processor::process(
+         config_.gap,
+         config_.max_zoom
+     );
++    if (full_frame_due(source, frame))
++        out.full_plan = pack({{0, 0, w, h}}, config_.canvas_w, config_.canvas_h, config_.gap, config_.max_zoom);
+     out.packing_ms = elapsed(start);
+-    out.status = out.plan.tiles.empty() ? Status::Idle : Status::Active;
++    out.status = !out.plan.tiles.empty() ? Status::Active
++                 : calibrating           ? Status::Calibrating
++                                         : Status::Idle;
+     return out;
+ }
+ }
+diff --git a/native/motion_preprocess/src/regions.cpp b/native/motion_preprocess/src/regions.cpp
+new file mode 100644
+index 0000000..505dd5b
+--- /dev/null
++++ b/native/motion_preprocess/src/regions.cpp
+@@ -0,0 +1,88 @@
++#include "vms_motion/regions.hpp"
++
++#include <algorithm>
++#include <cmath>
++#include <numeric>
++#include <stdexcept>
++
++namespace vms_motion {
++static double iou(const Box& a, const Box& b) {
++    double iw = std::max(0, std::min(a.x2, b.x2) - std::max(a.x1, b.x1)),
++           ih = std::max(0, std::min(a.y2, b.y2) - std::max(a.y1, b.y1)), inter = iw * ih,
++           area = double(a.width()) * a.height() + double(b.width()) * b.height() - inter;
++    return area > 0 ? inter / area : 0;
++}
++
++static bool unit(double v) {
++    return std::isfinite(v) && v >= 0 && v <= 1;
++}
++
++RegionTracker::RegionTracker(RegionConfig c)
++    : config_(c) {
++    if (c.max_misses < 1 || c.max_regions < 0 || !std::isfinite(c.padding) || c.padding < 0 ||
++        !unit(c.match_iou) || !unit(c.region_score) || !unit(c.seed_score))
++        throw std::invalid_argument("invalid region configuration");
++}
++
++// Best score first, each person takes the unmatched region it overlaps most (IoU >= match_iou, or its centre inside);
++// a person matching none opens a new region while there is room. Returns which regions were hit.
++std::vector<bool> RegionTracker::match(
++    std::uint64_t frame, const std::vector<Detection>& persons, double min_score
++) {
++    std::vector<bool> hit(regions_.size(), false);
++    std::vector<std::size_t> order(persons.size());
++    std::iota(order.begin(), order.end(), 0);
++    std::stable_sort(order.begin(), order.end(), [&](auto a, auto b) {
++        return persons[a].score > persons[b].score;
++    });
++    for (auto i : order) {
++        const auto& d = persons[i];
++        if (d.score < min_score || d.box.width() < 2 || d.box.height() < 2)
++            continue;
++        double cx = (d.box.x1 + d.box.x2) / 2., cy = (d.box.y1 + d.box.y2) / 2., best_iou = -1;
++        int best = -1;
++        for (std::size_t r = 0; r < regions_.size(); ++r) {
++            const auto& b = regions_[r].box;
++            double v = iou(d.box, b);
++            bool inside = cx >= b.x1 && cx < b.x2 && cy >= b.y1 && cy < b.y2;
++            if (!hit[r] && (v >= config_.match_iou || inside) && v > best_iou) {
++                best = int(r);
++                best_iou = v;
++            }
++        }
++        if (best >= 0) {
++            regions_[best].box = d.box;
++            regions_[best].misses = 0;
++            regions_[best].last_hit = frame;
++            hit[best] = true;
++        } else if (int(regions_.size()) < config_.max_regions) {
++            regions_.push_back({d.box, 0, frame, frame});
++            hit.push_back(true);
++        }
++    }
++    return hit;
++}
++
++void RegionTracker::update_mosaic(std::uint64_t frame, const std::vector<Detection>& persons) {
++    auto hit = match(frame, persons, config_.region_score);
++    std::size_t kept = 0;
++    for (std::size_t r = 0; r < regions_.size(); ++r)
++        if (hit[r] || ++regions_[r].misses < config_.max_misses)
++            regions_[kept++] = regions_[r];
++    regions_.resize(kept);
++}
++
++void RegionTracker::seed(std::uint64_t frame, const std::vector<Detection>& persons) {
++    match(frame, persons, config_.seed_score);
++}
++
++std::vector<Box> RegionTracker::crops(int width, int height) const {
++    std::vector<Box> out;
++    for (const auto& r : regions_) {
++        auto b = expand(r.box, config_.padding, width, height);
++        if (b.width() >= 2 && b.height() >= 2)
++            out.push_back(b);
++    }
++    return out;
++}
++}
+diff --git a/native/motion_preprocess/tests/gpu_test.cpp b/native/motion_preprocess/tests/gpu_test.cpp
+index 48bae34..b623362 100644
+--- a/native/motion_preprocess/tests/gpu_test.cpp
++++ b/native/motion_preprocess/tests/gpu_test.cpp
+@@ -83,6 +83,16 @@ int main() {
+             cv::norm(reference, cv::Mat(ch, cw, CV_8UC4, rendered.data()), cv::NORM_INF) <= 1,
+             "GPU canvas differs from reference"
+         );
++        // A full-frame slot is a plan with one tile covering the frame: it must equal the Ultralytics letterbox.
++        auto full = pack({{0, 0, w, h}}, cw, ch);
++        cv::Mat letterbox(ch, cw, CV_8UC4, cv::Scalar(114, 114, 114, 255)), scaled;
++        cv::resize(image, scaled, {full.resized_w, full.resized_h}, 0, 0, cv::INTER_LINEAR);
++        scaled.copyTo(letterbox(cv::Rect(full.pad_x, full.pad_y, full.resized_w, full.resized_h)));
++        auto whole = kernels.canvas(view, full);
++        check(
++            cv::norm(letterbox, cv::Mat(ch, cw, CV_8UC4, whole.data()), cv::NORM_INF) <= 1,
++            "full-frame canvas differs from the letterbox"
++        );
+         cuda_check(cudaMalloc(&tensor, 3 * cw * ch * sizeof(float)), "allocate test tensor");
+         std::array<float, 3> scales{.01f, .02f, .03f}, offsets{-.5f, .1f, .25f};
+         for (bool half : {false, true})
+@@ -187,6 +197,25 @@ int main() {
+         auto invalid = init;
+         invalid.user_configs["periodic-full-frame"] = "1";
+         check(initLib(invalid) == nullptr, "unsupported full-frame policy accepted");
++        auto tracked = init;
++        tracked.user_configs["full-frame-interval"] = "25";
++        tracked.user_configs["region-max-misses"] = "25";
++        tracked.user_configs["mosaic-classes"] = "0";
++        tracked.user_configs["full-frame-classes"] = "1;2;3;4;5;6";
++        auto* tracked_ctx = initLib(tracked);
++        check(tracked_ctx != nullptr, "full-frame and region configuration rejected");
++        deInitLib(tracked_ctx);
++        const std::pair<const char*, const char*> bad_values[] = {
++            {"region-max-misses", "0"},
++            {"full-frame-interval", "-1"},
++            {"mosaic-classes", "81"},
++            {"parser-lib", "/nonexistent/libparser.so"}
++        };
++        for (const auto& [key, value] : bad_values) {
++            auto bad = init;
++            bad.user_configs[key] = value;
++            check(initLib(bad) == nullptr, "invalid full-frame/region configuration accepted");
++        }
+         auto* warmup = initLib(init);
+         check(warmup != nullptr, "context warmup failed");
+         deInitLib(warmup);
+diff --git a/native/motion_preprocess/tests/motion_test.cpp b/native/motion_preprocess/tests/motion_test.cpp
+index 825accf..8cfdcb5 100644
+--- a/native/motion_preprocess/tests/motion_test.cpp
++++ b/native/motion_preprocess/tests/motion_test.cpp
+@@ -18,6 +18,13 @@ int main() {
+         for (int y = 0; y < bg.rows; ++y)
+             for (int x = 0; x < bg.cols; ++x)
+                 bg.at<unsigned char>(y, x) = 70 + (x / 8 + y / 8) % 40;
++        MotionDetector warm(bg.cols, bg.rows);
++        for (int i = 0; i < 400; ++i) {
++            auto boxes = warm.detect(bg);
++            check(i + 1 >= MotionConfig{}.history || warm.calibrating(),
++                  "calibration ended before the contrast history filled");
++            check(warm.calibrating() || boxes.empty(), "static scene reported motion after calibration");
++        }
+         MotionDetector md(bg.cols, bg.rows);
+         for (int i = 0; i < 400; ++i)
+             md.detect(bg);
+diff --git a/native/motion_preprocess/tests/regions_test.cpp b/native/motion_preprocess/tests/regions_test.cpp
+new file mode 100644
+index 0000000..5274b66
+--- /dev/null
++++ b/native/motion_preprocess/tests/regions_test.cpp
+@@ -0,0 +1,99 @@
++#include "vms_motion/processor.hpp"
++
++#include <cmath>
++#include <iostream>
++#include <stdexcept>
++
++#include <opencv2/imgproc.hpp>
++
++using namespace vms_motion;
++
++static void check(bool b, const char* m) {
++    if (!b)
++        throw std::runtime_error(m);
++}
++
++int main() {
++    try {
++        RegionConfig rc;
++        rc.max_misses = 3;
++        rc.max_regions = 2;
++        RegionTracker t(rc);
++        t.update_mosaic(1, {{{100, 100, 140, 220}, .9f}});
++        check(t.regions().size() == 1, "person did not open a region");
++        t.update_mosaic(2, {{{104, 102, 146, 224}, .8f}});
++        check(t.regions().size() == 1 && t.regions()[0].box.x1 == 104 && t.regions()[0].misses == 0,
++              "moved person did not refresh its region");
++        t.update_mosaic(3, {{{100, 100, 140, 220}, .3f}});
++        check(t.regions()[0].misses == 1, "person below region-score refreshed a region");
++        t.update_mosaic(4, {});
++        check(t.regions().size() == 1, "region removed before K misses");
++        t.update_mosaic(5, {});
++        check(t.regions().empty(), "region kept after K misses");
++        t.seed(6, {{{10, 10, 50, 90}, .9f}});
++        check(t.regions().size() == 1, "full-frame person did not seed a region");
++        for (int i = 7; i < 12; ++i)
++            t.seed(i, {});
++        check(t.regions().size() == 1 && t.regions()[0].misses == 0, "full-frame feedback counted misses");
++        t.update_mosaic(12, {{{10, 10, 50, 90}, .9f}, {{300, 10, 340, 90}, .8f}, {{500, 10, 540, 90}, .7f}});
++        check(t.regions().size() == 2, "max-regions not enforced");
++        auto crops = t.crops(400, 300);  // 40x80 boxes grown by 20 %: 8 px sideways, 16 px up/down, clipped
++        check(crops.size() == 2 && crops[0] == Box{2, 0, 58, 106} && crops[1] == Box{292, 0, 348, 106},
++              "region crops not padded and clipped");
++        bool threw = false;
++        try {
++            RegionConfig bad;
++            bad.max_misses = 0;
++            RegionTracker invalid(bad);
++        } catch (const std::invalid_argument&) {
++            threw = true;
++        }
++        check(threw, "region-max-misses 0 accepted");
++
++        Config c;
++        c.canvas_w = c.canvas_h = 768;
++        c.full_interval = 25;
++        c.regions.max_misses = 3;
++        Processor p(c);
++        check(p.full_frame_due(0, 0) && p.full_frame_due(0, 25) && !p.full_frame_due(0, 1), "source 0 schedule");
++        check(p.full_frame_due(1, 24) && p.full_frame_due(1, 49) && !p.full_frame_due(1, 0), "sources not staggered");
++        auto no_stagger = c;
++        no_stagger.full_stagger = false;
++        check(Processor(no_stagger).full_frame_due(1, 0), "full-frame-stagger 0 still offsets sources");
++        auto never = c;
++        never.full_interval = 0;
++        check(!Processor(never).full_frame_due(0, 0), "full-frame-interval 0 must disable full frames");
++
++        cv::Mat bg(720, 1280, CV_8UC1), small;
++        for (int y = 0; y < bg.rows; ++y)
++            for (int x = 0; x < bg.cols; ++x)
++                bg.at<unsigned char>(y, x) = 70 + (x / 40 + y / 40) % 40;
++        cv::resize(bg, small, {100 * bg.cols / bg.rows, 100}, 0, 0, cv::INTER_NEAREST);
++        auto step = [&](std::uint64_t frame) { return p.process(0, frame, frame * 40000000ULL, 1280, 720, small); };
++        FramePlan f;
++        for (std::uint64_t i = 0; i < 100; ++i)
++            f = step(i);
++        check(f.status == Status::Idle && f.plan.tiles.empty() && f.full_plan.tiles.empty(), "static frame not idle");
++        f = step(100);
++        const auto& full = f.full_plan;
++        check(full.tiles.size() == 1 && std::abs(full.scale_x - .6) < 1e-9 && full.resized_w == 768 &&
++                  full.resized_h == 432 && full.pad_x == 0 && full.pad_y == 168,
++              "full-frame plan is not the Ultralytics letterbox");
++        p.feedback(0, 100, false, {}, {{{600, 300, 680, 560}, .9f}});
++        f = step(101);
++        check(f.status == Status::Active && f.regions == 1 && f.motion_boxes == 0 && !f.plan.tiles.empty(),
++              "seeded region not in the mosaic of a static frame");
++        for (std::uint64_t i = 102; i < 105; ++i) {
++            p.feedback(0, i - 1, true, {}, {});
++            f = step(i);
++        }
++        check(f.status == Status::Idle && f.regions == 0, "region kept after K empty mosaics");
++        p.feedback(0, 104, false, {}, {{{600, 300, 680, 560}, .9f}});
++        p.reset_source(0);
++        check(step(105).regions == 0, "source reset kept regions");
++        std::cout << "region and full-frame checks passed\n";
++    } catch (const std::exception& e) {
++        std::cerr << e.what() << '\n';
++        return 1;
++    }
++}

@@ -232,7 +232,8 @@ def main():
             for a, b in zip(parts, parts[1:]):
                 assert a.link(b), f"cannot link {a.name} -> {b.name}"
     else:
-        sink = make("fakesink", "sink", sync=False)
+        # enable-last-sample would pin one batch, i.e. one of the few preprocess tensor buffers (tensor-buf-pool-size)
+        sink = make("fakesink", "sink", sync=False, enable_last_sample=False)
         pipe.add(sink)
         last.link(sink)
 
