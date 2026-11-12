@@ -159,8 +159,13 @@ def main():
     ap.add_argument("--input", action="append", required=True, help="file path or URI; repeat for more cameras")
     ap.add_argument("--output", default=None)
     ap.add_argument("--osd", choices=("on", "off"), default=None, help="override `osd` in the config")
+    ap.add_argument("--mux", default=None, help="override the mux size, WIDTHxHEIGHT (use the cameras' native size)")
+    ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
+                    help="override a preprocess.ini [user-configs] key, e.g. full-frame-interval=30; repeatable")
     args = ap.parse_args()
     cfg = yaml.safe_load(open(ROOT / args.config))
+    if args.mux:
+        cfg["muxer"]["width"], cfg["muxer"]["height"] = map(int, args.mux.lower().split("x"))
     out = ROOT / (args.output or cfg["output"])
     (out / "plans").mkdir(parents=True, exist_ok=True)
     osd = cfg["osd"] if args.osd is None else args.osd == "on"
@@ -171,6 +176,9 @@ def main():
     pre_cfg = read_ini(ROOT / cfg["preprocess_config"])
     pre_cfg["group-0"]["src-ids"] = ";".join(str(i) for i in range(len(args.input)))
     pre_cfg["user-configs"]["preview-dir"] = str(out / "plans")
+    for item in args.set:
+        key, value = item.split("=", 1)
+        pre_cfg["user-configs"][key.strip()] = value.strip()
     with open(out / "preprocess.ini", "w") as f:
         pre_cfg.write(f, space_around_delimiters=False)
     component = int(pre_cfg["property"]["unique-id"])
@@ -277,7 +285,7 @@ def main():
         "objects": {f"{c}/{o}": k for (c, o), k in sorted(dump.objects.items(), key=lambda kv: -kv[1])},
         "objects_without_payload": {f"{c}/size {s}": k for (c, s), k in dump.skipped.most_common()},
         "plans": plan_counters(out / "plans" / f"events_{component}.jsonl", len(args.input)),
-        "osd": osd, "config": cfg,
+        "osd": osd, "config": cfg, "preprocess_overrides": args.set,
     }
     json.dump(summary, open(out / "summary.json", "w"), indent=1)
     print(json.dumps({k: summary[k] for k in ("failed", "wall_s", "frames", "fps_all_streams", "objects",
