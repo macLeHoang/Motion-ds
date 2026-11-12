@@ -1,0 +1,17 @@
+# nvinfer config: runs the AIO engine on the tensors prepared by nvdspreprocess (mosaic and full-frame slots).
+# No parsing here: vms_motion_decode_probe (installed by the app on this element's src pad) reads the raw outputs.
+
+[property]
+gpu-id=0
+# = target-unique-ids / infer-unique-id in preprocess.ini
+gie-unique-id=2
+process-mode=1
+model-engine-file=/work/models/AIO_t13_11_11_768_b16.engine
+# >= network-input-shape batch in preprocess.ini, <= the engine's max batch
+batch-size=16
+network-mode=2
+input-tensor-from-meta=1
+network-type=100
+output-tensor-meta=1
+# loads the EfficientNMSX_TRT plugin the engine needs
+custom-lib-path=/plugins/libnvdsinfer_custom_impl_Yolo_seg.so

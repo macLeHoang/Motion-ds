@@ -211,7 +211,12 @@ void decode_batch(Context& c, NvDsBatchMeta* batch) {
         }
         for (const auto& det : kept)
             attach(batch, frame, det, d);
-        c.processor->feedback(frame->source_id, frame->frame_num, f.mosaic_ran, persons, seeds);
+        // nvinfer sets this only when it parses objects itself; nvtracker associates a frame's objects only when set.
+        // Frames without a slot keep it unset, so the tracker predicts through them instead of counting misses.
+        frame->bInferDone = TRUE;
+        std::lock_guard<std::mutex> lock(c.feedback_mutex);  // applied by the next CustomTensorPreparation
+        c.feedback.push_back({frame->source_id, std::uint64_t(frame->frame_num), f.mosaic_ran, std::move(persons),
+                              std::move(seeds)});
     }
 }
 }
@@ -225,8 +230,7 @@ extern "C" GstPadProbeReturn vms_motion_decode_probe(GstPad* pad, GstPadProbeInf
     if (!c)
         return GST_PAD_PROBE_OK;
     try {
-        std::lock_guard<std::mutex> lock(c->mutex);
-        decode_batch(*c, batch);
+        decode_batch(*c, batch);  // reads only immutable config and frame metadata; never takes c->mutex
     } catch (const std::exception& e) {
         std::cerr << "vms motion decode: " << e.what() << '\n';
         if (auto* owner = pad ? gst_pad_get_parent_element(pad) : nullptr) {

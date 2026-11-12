@@ -424,6 +424,13 @@ extern "C" NvDsPreProcessStatus CustomTensorPreparation(
     auto c = ctx->value;
     std::lock_guard<std::mutex> lock(c->mutex);
     try {
+        std::vector<Feedback> feedback;
+        {
+            std::lock_guard<std::mutex> queued(c->feedback_mutex);
+            feedback.swap(c->feedback);
+        }
+        for (const auto& f : feedback)
+            c->processor->feedback(f.source, f.frame, f.mosaic_ran, f.persons, f.seeds);
         cuda_check(cudaSetDevice(c->device), "select GPU");
         tensor.seq_params.roi_vector.clear();
         BufferMap mapped(batch->inbuf);
@@ -500,6 +507,8 @@ extern "C" NvDsPreProcessStatus CustomTensorPreparation(
         }
         for (std::size_t i = 0; i < plans.size(); ++i)
             attach_plan(batch->batch_meta, batch->units[i].frame_meta, plans[i]);
+        if (c->events.is_open())
+            c->events.flush();  // readable while the pipeline runs and complete at EOS
         tensor.params.network_input_shape = {int(slot), 3, c->config.canvas_h, c->config.canvas_w};
         tensor.params.buffer_size = slot * sample_bytes;
         return slot ? NVDSPREPROCESS_SUCCESS : NVDSPREPROCESS_TENSOR_NOT_READY;

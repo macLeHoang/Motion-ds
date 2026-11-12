@@ -1,0 +1,22 @@
+# app/motion_ds_app.py settings. Paths are relative to this folder's root (/work in the container).
+
+muxer:
+  width: 1280                  # mux output size = the frame coordinates of every crop and box; native camera size
+  height: 720
+  batched-push-timeout: 40000  # us
+  live-source: 0               # 1 for RTSP cameras
+
+preprocess_config: configs/preprocess.ini   # motion, N, K, classes, parser: see the comments there
+infer_config: configs/infer_mosaic.txt
+tracker_config: configs/tracker/config_tracker.txt   # empty: no tracker
+
+meta: configs/meta.json        # export metadata: names, attribute/child masks, payload layout
+attach:                        # yolo_attr_probe.attach after the tracker (labels, child boxes, plate corners)
+  attr_thr: 0.5
+  child_thr: 0.25
+  kpt_thr: 0.5
+  kpt_classes: [6]             # license_plate
+
+osd: true                      # true: one annotated mp4 per input; false: fakesink (throughput runs)
+bitrate: 4000000               # OSD video encoder bitrate
+output: runs/latest            # overridden by --output

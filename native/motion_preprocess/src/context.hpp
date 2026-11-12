@@ -1,6 +1,10 @@
 #pragma once
 // Internal: the state of one nvdspreprocess component, shared by the tensor preparation (preprocess.cpp) and the
-// decode probe on the following nvinfer (decoder.cpp). Lock `mutex` before touching `processor` or `gpu`.
+// decode probe on the following nvinfer (decoder.cpp).
+// Locking: `mutex` guards processor, gpu and preview state and is held by the tensor preparation, also while it waits
+// for a free tensor buffer. Tensor buffers come back only after nvinfer's output has passed the decode probe, so the
+// probe must never take `mutex`: it only appends to `feedback` (under `feedback_mutex`), which the tensor preparation
+// applies at the start of the next batch.
 
 #include "vms_motion/gpu.hpp"
 #include "vms_motion/processor.hpp"
@@ -27,6 +31,14 @@ struct DecoderConfig {
     void* parse = nullptr;             // NvDsInferParseCustomFunc-style instance-mask parser, e.g. NvDsInferYoloAttr
 };
 
+// Detector feedback for one frame, queued by the decode probe for Processor::feedback.
+struct Feedback {
+    unsigned source = 0;
+    std::uint64_t frame = 0;
+    bool mosaic_ran = false;
+    std::vector<Detection> persons, seeds;
+};
+
 struct Context {
     unsigned id = 0;
     int device = 0, capacity = 0;
@@ -37,6 +49,8 @@ struct Context {
     std::unique_ptr<Processor> processor;
     std::unique_ptr<Gpu> gpu;
     std::mutex mutex;
+    std::mutex feedback_mutex;
+    std::vector<Feedback> feedback;
     std::string preview_dir;
     std::string preview_session;
     double preview_fps = 1;
